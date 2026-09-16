@@ -1,8 +1,19 @@
-"""SQLite plumbing: schema, thread-local connections and small helpers.
+"""Storage layer with two interchangeable back ends.
 
-The application deliberately uses the standard library ``sqlite3`` module so
-there is nothing extra to install for a practice project, while still giving us
-real persistent storage that survives restarts.
+SQLite is the default, which keeps local development and the test-suite
+dependency-free. Set ``DATABASE_URL`` (a ``postgres://``/``postgresql://`` DSN)
+to run on Postgres instead — that is what serverless hosts such as Vercel need,
+because they have no writable persistent disk.
+
+The two back ends are deliberately kept behaviourally identical:
+
+* SQL is written once with ``?`` placeholders and translated to ``%s`` for
+  psycopg. The translation skips quoted literals so it can never corrupt a
+  string containing a question mark.
+* Timestamps are stored as ISO-8601 **text** in both back ends. The app only
+  ever compares them lexicographically (always UTC, always the same offset
+  format) or hands them to JavaScript, so text keeps the two dialects in exact
+  parity and avoids a whole class of timezone surprises.
 """
 from __future__ import annotations
 
@@ -15,9 +26,10 @@ from typing import Any, Iterable, Sequence
 
 from . import config
 
-SCHEMA = """
+# One source of truth for the schema; only the primary-key clause differs.
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            INTEGER {pk},
     email         TEXT    NOT NULL UNIQUE,
     name          TEXT    NOT NULL,
     password_hash TEXT    NOT NULL,
@@ -27,7 +39,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS groups (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            INTEGER {pk},
     owner_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name          TEXT    NOT NULL,
     handle        TEXT    NOT NULL,
@@ -44,7 +56,7 @@ CREATE TABLE IF NOT EXISTS groups (
 );
 
 CREATE TABLE IF NOT EXISTS authors (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            INTEGER {pk},
     owner_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id      INTEGER REFERENCES groups(id) ON DELETE CASCADE,
     name          TEXT    NOT NULL,
@@ -56,8 +68,26 @@ CREATE TABLE IF NOT EXISTS authors (
     created_at    TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS rules (
+    id             INTEGER {pk},
+    owner_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    group_id       INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+    name           TEXT    NOT NULL,
+    description    TEXT    NOT NULL DEFAULT '',
+    condition_type TEXT    NOT NULL DEFAULT 'keyword',
+    condition_value TEXT   NOT NULL DEFAULT '',
+    threshold      INTEGER NOT NULL DEFAULT 0,
+    action         TEXT    NOT NULL DEFAULT 'delete',
+    severity       TEXT    NOT NULL DEFAULT 'medium',
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    runs           INTEGER NOT NULL DEFAULT 0,
+    affected       INTEGER NOT NULL DEFAULT 0,
+    last_run_at    TEXT,
+    created_at     TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS posts (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id            INTEGER {pk},
     owner_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     group_id      INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
     author_id     INTEGER REFERENCES authors(id) ON DELETE SET NULL,
@@ -79,26 +109,8 @@ CREATE TABLE IF NOT EXISTS posts (
     deleted_at    TEXT
 );
 
-CREATE TABLE IF NOT EXISTS rules (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    group_id       INTEGER REFERENCES groups(id) ON DELETE CASCADE,
-    name           TEXT    NOT NULL,
-    description    TEXT    NOT NULL DEFAULT '',
-    condition_type TEXT    NOT NULL DEFAULT 'keyword',
-    condition_value TEXT   NOT NULL DEFAULT '',
-    threshold      INTEGER NOT NULL DEFAULT 0,
-    action         TEXT    NOT NULL DEFAULT 'delete',
-    severity       TEXT    NOT NULL DEFAULT 'medium',
-    enabled        INTEGER NOT NULL DEFAULT 1,
-    runs           INTEGER NOT NULL DEFAULT 0,
-    affected       INTEGER NOT NULL DEFAULT 0,
-    last_run_at    TEXT,
-    created_at     TEXT    NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS clean_jobs (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           INTEGER {pk},
     owner_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name         TEXT    NOT NULL,
     group_ids    TEXT    NOT NULL DEFAULT '[]',
@@ -113,7 +125,7 @@ CREATE TABLE IF NOT EXISTS clean_jobs (
 );
 
 CREATE TABLE IF NOT EXISTS activity (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           INTEGER {pk},
     owner_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     actor        TEXT    NOT NULL,
     action       TEXT    NOT NULL,
@@ -134,11 +146,19 @@ CREATE INDEX IF NOT EXISTS idx_rules_owner ON rules(owner_id);
 CREATE INDEX IF NOT EXISTS idx_authors_owner ON authors(owner_id);
 """
 
+DIALECTS = {
+    "sqlite": {"pk": "PRIMARY KEY AUTOINCREMENT"},
+    "postgres": {"pk": "GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"},
+}
+
+DRIVER = "postgres" if config.DATABASE_URL else "sqlite"
+
 _local = threading.local()
 _lock = threading.Lock()
-# Every connection this process has opened, so `close_conn()` can drop them all.
-# Without this, pooled worker threads (e.g. FastAPI's TestClient portal) keep a
-# live handle on a database file that has already been swapped out.
+_pool = None
+# Every sqlite connection this process has opened, so `close_conn()` can drop
+# them all. Without this, pooled worker threads keep a live handle on a database
+# file that has already been swapped out (which is exactly what the tests do).
 _all_conns: list[sqlite3.Connection] = []
 
 
@@ -147,8 +167,65 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def get_conn() -> sqlite3.Connection:
-    """Return a per-thread connection, creating (and migrating) it if needed."""
+def translate(sql: str) -> str:
+    """Rewrite ``?`` placeholders to psycopg's ``%s``, skipping quoted text."""
+    if DRIVER == "sqlite":
+        return sql
+    out: list[str] = []
+    quote: str | None = None
+    for char in sql:
+        if quote:
+            out.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+            out.append(char)
+            continue
+        out.append("%s" if char == "?" else char)
+    return "".join(out)
+
+
+def date_expr(column: str) -> str:
+    """Calendar-day bucket for the activity timeline, per dialect."""
+    return f"date({column})" if DRIVER == "sqlite" else f"date({column}::timestamptz)"
+
+
+def init_db() -> None:
+    # Plain replace, not str.format: the schema contains a literal '{}' in
+    # `DEFAULT '{}'`, which format() would try to interpret as a field.
+    schema = _SCHEMA.replace("{pk}", DIALECTS[DRIVER]["pk"])
+    if DRIVER == "sqlite":
+        get_conn().executescript(schema)
+        get_conn().commit()
+    else:
+        # Pool.connection() yields a connection from a context manager; it is
+        # not a connection itself, so it must be entered before use.
+        with get_conn() as conn, conn.cursor() as cursor:
+            cursor.execute(schema)
+            conn.commit()
+
+
+def reset_db(path: Path | str | None = None) -> None:
+    """Drop every table. Used by the test-suite and ``seed --fresh``."""
+    global _pool
+    if path is not None and DRIVER == "sqlite":
+        config.DB_PATH = Path(path)
+    close_conn()
+    if DRIVER == "sqlite":
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            candidate = Path(f"{config.DB_PATH}{suffix}")
+            if candidate.exists():
+                candidate.unlink()
+    init_db()
+    if DRIVER == "postgres":
+        for table in ("activity", "clean_jobs", "posts", "rules", "authors", "groups", "users"):
+            execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
+
+
+# --------------------------------------------------------------- connections
+def _sqlite_conn() -> sqlite3.Connection:
     conn = getattr(_local, "conn", None)
     if conn is None:
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -163,12 +240,33 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def close_conn() -> None:
-    """Close this thread's connection *and* every other open one.
+def _pg_pool():
+    """Lazily built connection pool (serverless cold starts must not hang)."""
+    global _pool
+    if _pool is None:
+        from psycopg_pool import ConnectionPool
+        from psycopg.rows import dict_row
 
-    Callers that swap ``config.DB_PATH`` (tests, ``seed --fresh``) rely on this
-    to make sure no thread keeps reading the old file.
-    """
+        _pool = ConnectionPool(
+            config.DATABASE_URL,
+            min_size=0,
+            max_size=int(config.PG_POOL_MAX),
+            kwargs={"row_factory": dict_row, "autocommit": False},
+            open=True,
+            timeout=30,
+        )
+    return _pool
+
+
+def get_conn():
+    if DRIVER == "sqlite":
+        return _sqlite_conn()
+    return _pg_pool().connection()
+
+
+def close_conn() -> None:
+    """Close this thread's sqlite connection, every other open one, and the pool."""
+    global _pool
     with _lock:
         for conn in _all_conns:
             try:
@@ -177,30 +275,24 @@ def close_conn() -> None:
                 pass
         _all_conns.clear()
     _local.conn = None
+    if _pool is not None:
+        try:
+            _pool.close()
+        except Exception:  # noqa: BLE001 - pool may already be shut down
+            pass
+        _pool = None
 
 
-def init_db() -> None:
-    get_conn().executescript(SCHEMA)
-    get_conn().commit()
-
-
-def reset_db(path: Path | None = None) -> None:
-    """Drop every table. Used by the test-suite and ``seed --fresh``."""
-    if path is not None:
-        config.DB_PATH = Path(path)
-    close_conn()
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        candidate = Path(f"{config.DB_PATH}{suffix}")
-        if candidate.exists():
-            candidate.unlink()
-    init_db()
-
-
+# ------------------------------------------------------------------- queries
 def query(sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
-    cur = get_conn().execute(sql, tuple(params))
-    rows = cur.fetchall()
-    cur.close()
-    return [dict(row) for row in rows]
+    if DRIVER == "sqlite":
+        cur = get_conn().execute(sql, tuple(params))
+        rows = [dict(row) for row in cur.fetchall()]
+        cur.close()
+        return rows
+    with get_conn() as conn, conn.cursor() as cursor:
+        cursor.execute(translate(sql), tuple(params))
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def query_one(sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
@@ -209,42 +301,57 @@ def query_one(sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
 
 
 def execute(sql: str, params: Sequence[Any] = ()) -> int:
-    """Run a write statement and return the new/affected row id."""
-    conn = get_conn()
-    cur = conn.execute(sql, tuple(params))
-    conn.commit()
-    row_id = cur.lastrowid or cur.rowcount
-    cur.close()
-    return int(row_id)
+    """Run a write statement and return the new (or affected) row id."""
+    if DRIVER == "sqlite":
+        conn = get_conn()
+        cur = conn.execute(sql, tuple(params))
+        conn.commit()
+        row_id = cur.lastrowid or cur.rowcount
+        cur.close()
+        return int(row_id)
+
+    with get_conn() as conn, conn.cursor() as cursor:
+        statement = translate(sql)
+        if statement.lstrip().upper().startswith("INSERT"):
+            statement = f"{statement} RETURNING id"
+            cursor.execute(statement, tuple(params))
+            row = cursor.fetchone()
+            conn.commit()
+            return int(row["id"]) if row else 0
+        cursor.execute(statement, tuple(params))
+        affected = cursor.rowcount
+        conn.commit()
+        return int(affected)
 
 
 def execute_many(sql: str, seq: Iterable[Sequence[Any]]) -> int:
-    conn = get_conn()
-    cur = conn.executemany(sql, [tuple(item) for item in seq])
-    conn.commit()
-    count = cur.rowcount
-    cur.close()
-    return count
+    rows = list(seq)
+    if not rows:
+        return 0
+    if DRIVER == "sqlite":
+        conn = get_conn()
+        cur = conn.executemany(sql, [tuple(item) for item in rows])
+        conn.commit()
+        count = cur.rowcount
+        cur.close()
+        return count
+    with get_conn() as conn, conn.cursor() as cursor:
+        cursor.executemany(translate(sql), [tuple(item) for item in rows])
+        affected = cursor.rowcount
+        conn.commit()
+        return affected
 
 
 def scalar(sql: str, params: Sequence[Any] = ()) -> Any:
-    cur = get_conn().execute(sql, tuple(params))
-    row = cur.fetchone()
-    cur.close()
-    return row[0] if row else None
-
-
-def dump_json(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), default=str)
-
-
-def load_json(value: str | None, fallback: Any = None) -> Any:
-    if not value:
-        return fallback
-    try:
-        return json.loads(value)
-    except (TypeError, ValueError):
-        return fallback
+    if DRIVER == "sqlite":
+        cur = get_conn().execute(sql, tuple(params))
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else None
+    with get_conn() as conn, conn.cursor() as cursor:
+        cursor.execute(translate(sql), tuple(params))
+        row = cursor.fetchone()
+        return next(iter(row.values())) if row else None
 
 
 def paginate(
@@ -262,3 +369,16 @@ def paginate(
     # caller's ``params`` are the *only* bound values.
     rows = query(sql.format(limit=per_page, offset=offset), list(params))
     return rows, {"page": page, "per_page": per_page}
+
+
+def dump_json(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), default=str)
+
+
+def load_json(value: str | None, fallback: Any = None) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return fallback

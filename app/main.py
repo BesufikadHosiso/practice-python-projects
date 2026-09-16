@@ -8,7 +8,32 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 
 from . import config, database as db
+from . import database
 from .routers import activity, authors, auth, groups, jobs, posts, rules, stats
+
+
+def _assert_storage_is_usable() -> None:
+    """Fail loudly and helpfully when storage cannot work.
+
+    On a serverless host (Vercel and friends) the deployment directory is
+    read-only and there is no persistent disk, so the bundled SQLite file
+    cannot be used at all. Without this guard the app dies later with a bare
+    PermissionError; here we say exactly what to do instead.
+    """
+    if database.DRIVER == "postgres":
+        return
+    try:
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        probe = config.DATA_DIR / ".write-probe"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot use the bundled SQLite database at {config.DB_PATH} ({error}). "
+            "This usually means the filesystem is read-only, as it is on Vercel. "
+            "Set DATABASE_URL to a PostgreSQL connection string "
+            "(postgresql://user:pass@host/db?sslmode=require) and redeploy."
+        ) from error
 
 
 def create_app() -> FastAPI:
@@ -33,6 +58,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    _assert_storage_is_usable()
+
     db.init_db()
 
     # Self-healing: if the database is empty (fresh clone, or `data/` was
@@ -41,7 +68,6 @@ def create_app() -> FastAPI:
         from .seed import seed
 
         seed(fresh=False, verbose=False)
-
     for module in (auth, groups, posts, rules, authors, jobs, activity, stats):
         app.include_router(module.router)
 

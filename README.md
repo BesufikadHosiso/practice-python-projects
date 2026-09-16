@@ -33,7 +33,7 @@ demand.
 ## Tests
 
 ```bash
-python -m pytest -q          # 48 tests, each against a throwaway database
+python -m pytest -q          # 55 tests, each against a throwaway database
 ```
 
 ---
@@ -103,6 +103,73 @@ code path powers dry runs, previews and real runs, so what you preview is what y
 > simulated — it fabricates believable new posts so the queue has something to work through.
 > Everything downstream of the sync is real.
 
+## Deploying
+
+### Vercel (Postgres required)
+
+Vercel is serverless: the deployment directory is **read-only** and there is no
+persistent disk, so the bundled SQLite file cannot be used. Set `DATABASE_URL`
+to a managed Postgres (Neon and Supabase both have free tiers):
+
+1. Create a database and copy its connection string.
+2. In the Vercel project, add these environment variables:
+
+   | Variable | Value |
+   | --- | --- |
+   | `DATABASE_URL` | `postgresql://user:pass@host/db?sslmode=require` |
+   | `PGPC_SECRET_KEY` | a long random string — see below |
+   | `PGPC_DEMO_PASSWORD` | optional, changes the demo login |
+
+   ```bash
+   python3 -c "import secrets; print(secrets.token_urlsafe(48))"   # a good SECRET_KEY
+   ```
+
+3. Import the repo and deploy. `vercel.json` and `api/index.py` are already in
+   place — the latter bridges FastAPI (ASGI) to the WSGI runtime Vercel's Python
+   builder provides.
+
+The schema is created and the demo workspace seeded automatically on first
+request.
+
+> `PGPC_SECRET_KEY` is not optional in production. It signs every auth token,
+> and the checked-in default is public — without your own, anyone could mint a
+> valid token for any user.
+>
+> If you deploy without `DATABASE_URL`, startup fails immediately with a message
+> saying so, rather than dying later with a confusing `PermissionError`.
+
+### Anywhere with a real disk (no config needed)
+
+Render, Railway, Fly.io or a plain VPS can run the SQLite build unchanged:
+
+```bash
+pip install -r requirements.txt
+./run.sh
+```
+
+`run.sh` installs dependencies and serves on port 8000. For a container, point
+the start command at
+`uvicorn app.main:app --host 0.0.0.0 --port $PORT` and mount a volume at
+`/app/data` so the database survives restarts.
+
+### Storage back ends
+
+| | SQLite (default) | Postgres (`DATABASE_URL` set) |
+| --- | --- | --- |
+| Setup | none | a connection string |
+| Persistence | `data/cleaner.db` | the managed database |
+| Good for | local dev, tests, single-host deploys | serverless, multiple instances |
+
+Both are exercised by the test-suite: the SQLite path runs on every
+`pytest`, and `tests/test_postgres_dialect.py` verifies the Postgres dialect
+statically (SQL parses as Postgres, no SQLite-only clauses, correct placeholder
+translation, correct connection-pool usage). To run the **whole** suite against
+a live server:
+
+```bash
+DATABASE_URL=postgresql://... python -m pytest
+```
+
 ## Frontend notes
 
 No framework and no bundler: 18 ES modules served straight from disk, lazily imported per route.
@@ -124,4 +191,4 @@ No framework and no bundler: 18 ES modules served straight from disk, lazily imp
 | `./run.sh` | Seed (if needed) and serve on port 8000 |
 | `./scripts/smoke.sh` | Curl-driven smoke test against a running server |
 | `python -m app.seed --fresh` | Rebuild the demo workspace from scratch |
-| `python -m pytest -q` | Run the test suite (48 tests) |
+| `python -m pytest -q` | Run the test suite (55 tests) |

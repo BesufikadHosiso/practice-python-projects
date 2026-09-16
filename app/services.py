@@ -145,7 +145,7 @@ def list_groups(owner_id: int, q: str = "", page: int = 1, per_page: int = 50) -
     where = " AND ".join(clauses)
     total = db.scalar(f"SELECT COUNT(*) FROM groups g WHERE {where}", params) or 0
     rows, page_info = db.paginate(
-        f"{GROUP_SELECT} WHERE {where} ORDER BY g.name COLLATE NOCASE LIMIT {{limit}} OFFSET {{offset}}",
+        f"{GROUP_SELECT} WHERE {where} ORDER BY lower(g.name) LIMIT {{limit}} OFFSET {{offset}}",
         params,
         page,
         per_page,
@@ -221,7 +221,7 @@ SORTS = {
     "oldest": "p.created_at ASC, p.id ASC",
     "engagement": "(p.likes + p.comments * 2 + p.shares * 3) DESC, p.id DESC",
     "reports": "p.reports DESC, (p.likes + p.comments) ASC, p.id DESC",
-    "title": "p.message COLLATE NOCASE ASC",
+    "title": "lower(p.message) ASC",
 }
 
 
@@ -301,9 +301,11 @@ def build_filters(
         clauses.append("lower(p.message) LIKE ?")
         params.append(f"%{message_q.lower()}%")
     if contains_link is True:
-        clauses.append("lower(p.message) LIKE '%http%'")
+        clauses.append("lower(p.message) LIKE ?")
+        params.append("%http%")
     elif contains_link is False:
-        clauses.append("lower(p.message) NOT LIKE '%http%'")
+        clauses.append("lower(p.message) NOT LIKE ?")
+        params.append("%http%")
     if author_id is not None:
         clauses.append("p.author_id = ?")
         params.append(author_id)
@@ -799,7 +801,7 @@ def list_authors(owner_id: int, *, q: str = "", group_id: int | None = None) -> 
                       AND p.deleted_at IS NOT NULL) AS removed
             FROM authors a LEFT JOIN groups g ON g.id = a.group_id
             WHERE {' AND '.join(clauses)}
-            ORDER BY removed DESC, a.name COLLATE NOCASE LIMIT 200""",
+            ORDER BY removed DESC, lower(a.name) LIMIT 200""",
         params,
     )
     return [
@@ -1066,7 +1068,7 @@ def timeline(owner_id: int, days: int = 14) -> list[dict[str, Any]]:
         key = (start + timedelta(days=offset)).date().isoformat()
         buckets[key] = {"date": key, "deleted": 0, "pending": 0, "flagged": 0}
     rows = db.query(
-        """SELECT date(COALESCE(deleted_at, published_at, created_at)) AS day,
+        f"""SELECT {db.date_expr("COALESCE(deleted_at, published_at, created_at)")} AS day,
                   SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) AS deleted,
                   SUM(CASE WHEN deleted_at IS NULL AND state = 'pending' THEN 1 ELSE 0 END) AS pending,
                   SUM(CASE WHEN deleted_at IS NULL AND state = 'flagged' THEN 1 ELSE 0 END) AS flagged
