@@ -111,22 +111,55 @@ Vercel is serverless: the deployment directory is **read-only** and there is no
 persistent disk, so the bundled SQLite file cannot be used. Set `DATABASE_URL`
 to a managed Postgres (Neon and Supabase both have free tiers):
 
-1. Create a database and copy its connection string.
-2. In the Vercel project, add these environment variables:
+#### 1. Create the Supabase database
 
-   | Variable | Value |
-   | --- | --- |
-   | `DATABASE_URL` | `postgresql://user:pass@host/db?sslmode=require` |
-   | `PGPC_SECRET_KEY` | a long random string — see below |
-   | `PGPC_DEMO_PASSWORD` | optional, changes the demo login |
+Supabase dashboard → your project → **Project Settings → Database → Connection
+string → URI**, and pick the **Transaction pooler** (port `6543`). Copy the URI.
+It looks like:
 
-   ```bash
-   python3 -c "import secrets; print(secrets.token_urlsafe(48))"   # a good SECRET_KEY
-   ```
+```
+postgresql://postgres.abcdefgh:YOUR-PASSWORD@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+```
 
-3. Import the repo and deploy. `vercel.json` and `api/index.py` are already in
-   place — the latter bridges FastAPI (ASGI) to the WSGI runtime Vercel's Python
-   builder provides.
+Append `?sslmode=require` if it is not already there.
+
+#### 2. Add the Vercel environment variables
+
+| Variable | Required | Value |
+| --- | --- | --- |
+| `DATABASE_URL` | **yes** | the Supabase URI, with `?sslmode=require` |
+| `PGPC_SECRET_KEY` | **yes** | a long random string (see below) |
+| `PGPC_DEMO_EMAIL` | no | demo login email, default `admin@demo.com` |
+| `PGPC_DEMO_PASSWORD` | no | demo login password, default `demo1234` |
+| `PGPC_PG_POOL_MAX` | no | pool size, default `5` |
+| `PGPC_PG_CONNECT_TIMEOUT` | no | connect timeout seconds, default `10` |
+
+Generate a secret key:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+#### 3. Deploy
+
+Import the repo and deploy. `vercel.json` and `api/index.py` are already in
+place — the latter bridges FastAPI (ASGI) to the WSGI runtime Vercel's Python
+builder provides. The schema is created and the demo workspace seeded
+automatically on the first request.
+
+#### Supabase notes
+
+- **Use the transaction pooler (port 6543), not the direct connection (5432).**
+  Vercel functions are short-lived and numerous; the direct connection hits
+  Supabase's connection limit quickly.
+- The code sets psycopg's `prepare_threshold` to `None`. PgBouncer in
+  transaction mode cannot carry prepared statements across the transactions it
+  multiplexes, and psycopg3 promotes a query to a prepared statement after 5
+  executions by default — so without this a busy deployment fails
+  intermittently with `prepared statement … does not exist`.
+- If your password contains `@`, `:` or `/`, percent-encode it in the URI.
+- Free-tier Supabase projects pause after a week of inactivity; the first
+  request after a pause will be slow or fail until you resume the project.
 
 The schema is created and the demo workspace seeded automatically on first
 request.

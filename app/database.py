@@ -251,7 +251,19 @@ def _pg_pool():
             config.DATABASE_URL,
             min_size=0,
             max_size=int(config.PG_POOL_MAX),
-            kwargs={"row_factory": dict_row, "autocommit": False},
+            kwargs={
+                "row_factory": dict_row,
+                "autocommit": False,
+                # Supabase's transaction pooler (port 6543) is PgBouncer in
+                # transaction mode, which cannot carry prepared statements
+                # across the transactions it multiplexes. psycopg3 promotes a
+                # query to a prepared statement after 5 executions by default
+                # (prepare_threshold=5), so a busy deployment would start
+                # failing intermittently. None disables promotion entirely,
+                # which works with the transaction *and* session poolers.
+                "prepare_threshold": None,
+                "connect_timeout": int(config.PG_CONNECT_TIMEOUT),
+            },
             open=True,
             timeout=30,
         )

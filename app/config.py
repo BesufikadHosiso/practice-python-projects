@@ -20,6 +20,9 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # serverless host such as Vercel requires — those have no writable disk.
 DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("PGPC_DATABASE_URL") or ""
 PG_POOL_MAX = os.environ.get("PGPC_PG_POOL_MAX", "5")
+# Fail fast on a serverless cold start rather than hanging until the platform
+# kills the function.
+PG_CONNECT_TIMEOUT = os.environ.get("PGPC_PG_CONNECT_TIMEOUT", "10")
 
 SECRET_KEY = os.environ.get("PGPC_SECRET_KEY", "dev-secret-please-change-in-production")
 TOKEN_TTL_SECONDS = int(os.environ.get("PGPC_TOKEN_TTL", 60 * 60 * 12))
