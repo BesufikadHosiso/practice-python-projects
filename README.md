@@ -17,23 +17,23 @@ admin@demo.com  /  demo1234
 
 ```bash
 pip install -r requirements.txt
-
-python -m app.seed --fresh            # create the demo workspace (idempotent)
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Or just `./run.sh`, which does both.
+Or just `./run.sh`, which installs dependencies and starts the server.
 
 Open <http://localhost:8000> and sign in with the credentials above. The API docs are at
 <http://localhost:8000/api/docs>.
 
-Everything the app writes lives in `data/cleaner.db` (git-ignored). `python -m app.seed --fresh`
-wipes and rebuilds it.
+Everything the app writes lives in `data/cleaner.db` (git-ignored). **If the database is empty
+the demo workspace seeds itself on startup**, so a fresh clone — or a wiped `data/` — serves a
+fully populated app with no extra step. Use `python -m app.seed --fresh` to rebuild it on
+demand.
 
 ## Tests
 
 ```bash
-python -m pytest -q          # 47 tests, each against a throwaway database
+python -m pytest -q          # 48 tests, each against a throwaway database
 ```
 
 ---
@@ -124,4 +124,4 @@ No framework and no bundler: 18 ES modules served straight from disk, lazily imp
 | `./run.sh` | Seed (if needed) and serve on port 8000 |
 | `./scripts/smoke.sh` | Curl-driven smoke test against a running server |
 | `python -m app.seed --fresh` | Rebuild the demo workspace from scratch |
-| `python -m pytest -q` | Run the test suite |
+| `python -m pytest -q` | Run the test suite (48 tests) |

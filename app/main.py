@@ -35,6 +35,13 @@ def create_app() -> FastAPI:
 
     db.init_db()
 
+    # Self-healing: if the database is empty (fresh clone, or `data/` was
+    # wiped), build the demo workspace so the app is never served broken.
+    if not (db.scalar("SELECT COUNT(*) FROM users") or 0):
+        from .seed import seed
+
+        seed(fresh=False, verbose=False)
+
     for module in (auth, groups, posts, rules, authors, jobs, activity, stats):
         app.include_router(module.router)
 

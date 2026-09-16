@@ -463,6 +463,18 @@ class TestObservability:
 
 # ------------------------------------------------------------- app plumbing
 class TestPlumbing:
+    def test_empty_database_seeds_itself_on_startup(self, client):
+        """A fresh checkout (or a wiped data/) must serve a working app."""
+        response = client.post(
+            "/api/auth/login", json={"email": "admin@demo.com", "password": "demo1234"}
+        )
+        assert response.status_code == 200, "the demo workspace should exist without a manual seed"
+        client.headers["Authorization"] = f"Bearer {response.json()['token']}"
+        stats = client.get("/api/stats/overview").json()
+        assert stats["groups"]["total"] == 6
+        assert stats["posts"]["live"] > 100
+        assert stats["cleanup"]["rules_total"] == 9
+
     def test_health_endpoint_is_public(self, client):
         response = client.get("/api/health")
         assert response.status_code == 200
